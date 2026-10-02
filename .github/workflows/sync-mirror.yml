@@ -1,0 +1,91 @@
+name: "Sync NXP firmware"
+
+# Mirror the NXP firmware packages Armbian builds download, one branch per
+# package. The download runs on GitHub's runners, which can reach www.nxp.com.
+on:
+  schedule:
+    - cron: "17 4 * * *"   # daily, 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-mirror
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: "https://www.nxp.com/lgfiles/NMG/MAD/YOCTO"
+  BUILD_REPO: "armbian/build"
+
+jobs:
+  sync:
+    if: ${{ github.repository_owner == 'armbian' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: "Mirror new packages"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Package names used by armbian/build, plus any listed by hand.
+          git clone -q --depth 1 --filter=blob:none --sparse "https://github.com/${BUILD_REPO}.git" build
+          git -C build sparse-checkout set config/sources/families
+          {
+            grep -rhoE "firmware-(imx|ele-imx|sentinel|upower)-[0-9][0-9.]*[0-9](-[0-9a-f]{7})?" build/config/sources/families || true
+            grep -vE "^[[:space:]]*(#|$)" mirror.list || true
+          } | sort -u > "${RUNNER_TEMP}/packages.txt"
+          cat "${RUNNER_TEMP}/packages.txt"
+
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          added=0
+          while read -r pkg; do
+            branch="${pkg%%-[0-9]*}"   # firmware-imx-8.26-d4c33ab -> firmware-imx
+            work="${RUNNER_TEMP}/${branch}"
+            rm -rf "${work}" && mkdir "${work}" && cd "${work}"
+            git init -q -b "${branch}"
+            if git fetch -q --depth 1 "${remote}" "refs/heads/${branch}" 2> /dev/null; then
+              git checkout -q -B "${branch}" FETCH_HEAD
+            fi
+
+            curl -fsSL --retry 3 -o "${pkg}.bin.new" "${UPSTREAM}/${pkg}.bin"
+            new="$(sha256sum "${pkg}.bin.new" | cut -d' ' -f1)"
+            if [[ -f "${pkg}.bin" ]]; then
+              old="$(sha256sum "${pkg}.bin" | cut -d' ' -f1)"
+              if [[ "${old}" != "${new}" ]]; then
+                echo "::error::${pkg}.bin changed upstream (${old} -> ${new}); not overwriting"
+                exit 1
+              fi
+              echo "${pkg}: already mirrored"
+              continue
+            fi
+
+            mv "${pkg}.bin.new" "${pkg}.bin"
+            sha256sum -- *.bin > SHA256SUMS
+            git add "${pkg}.bin" SHA256SUMS
+            git commit -q -m "Add ${pkg}.bin" -m "sha256 ${new}"
+            git push -q "${remote}" "HEAD:refs/heads/${branch}"
+            echo "Added ${pkg}.bin to ${branch} (sha256 ${new})" | tee -a "${GITHUB_STEP_SUMMARY}"
+            added=$((added + 1))
+          done < "${RUNNER_TEMP}/packages.txt"
+          echo "New packages: ${added}" >> "${GITHUB_STEP_SUMMARY}"
+
+  # GitHub disables a repository's scheduled workflows after 60 days without
+  # activity, and pushes made with GITHUB_TOKEN do not count. This re-arms the
+  # schedule on every run, the same way armbian/phytium-linux-kernel does.
+  keepalive:
+    if: ${{ github.repository_owner == 'armbian' }}
+    name: Keep Alive
+    needs: sync
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: liskin/gh-workflow-keepalive@f72ff1a1336129f29bf0166c0fd0ca6cf1bcb38c # v1.2.1

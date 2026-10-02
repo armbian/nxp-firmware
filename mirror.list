@@ -1,0 +1,2 @@
+# Extra NXP packages to mirror, one name per line (without .bin).
+# Names used by armbian/build main (config/sources/families) are found automatically.
